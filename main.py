@@ -1,4 +1,17 @@
 import os
+import subprocess
+import sys
+from pathlib import Path
+def ensure_shadowAI():
+    venv = Path.cwd() / ".shadowAI"
+    py = venv / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+    if Path(sys.prefix).resolve() != venv.resolve():
+        if not py.exists():
+            raise FileNotFoundError("'.shadowAI' venv not found in current directory.\nRun setup again.")
+        sys.exit(subprocess.run([str(py)] + sys.argv).returncode)
+
+ensure_shadowAI()
+
 import httpx
 import io
 from dotenv import load_dotenv
