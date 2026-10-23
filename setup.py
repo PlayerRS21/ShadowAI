@@ -192,27 +192,43 @@ def main():
     print()
     gemini_api=input("Enter your google gemini api key from 'https://aistudio.google.com/api-keys': ")
     print()
+    
     openrouter_api=input("Enter your openrouter api key from 'https://openrouter.ai/': ")
     print()
+    
     groq_api=input("Enter your groq api key fron 'https://console.groq.com/home': ")
     print()
+    
+    groq_api2=input("Enter your second groq api key fron 'https://console.groq.com/home': ")
+    print()
+    
     fish_api=input("Enter your fish audio api key fron 'https://fish.audio/app/api-keys/': ")
     print()
     
+    tavily_api=input("Enter your tavily search api key fron 'https://fish.audio/app/api-keys/': ")
+    print()
+    
     if not gemini_api:
-        print("Gemini API key not provided may affect the performance and uptime")
+        print("Gemini API key not provided may affect the performance and uptime.")
+        print()
 
     if not openrouter_api:
-        print("OpenRouter API key not provided may affect the performance and uptime")
+        print("OpenRouter API key not provided may affect the performance and uptime.")
+        print()
 
     if not groq_api:
-        print("GROQ API key not provided may affect the performance and uptime")
-
+        print("GROQ API key not provided may affect the performance and uptime.")
+        print()
+        
     if not fish_api:
-        print("Fish Audio API key not provided may affect the user experience")
+        print("Fish Audio API key not provided may affect the user experience.")
+        print()
+
+    if not tavily_api:
+        print("Tavily Search Api kwy not provided may affect the searches.")
             
     with open(".env","w") as f:
-        txt=f"GEMINI_API_KEY={gemini_api}\nOPENROUTER_API_KEY={openrouter_api}\nGROQ_API_KEY={groq_api}\nFISH_AUDIO_API_KEY={fish_api}"
+        txt=f"GEMINI_API_KEY={gemini_api}\nOPENROUTER_API_KEY={openrouter_api}\nGROQ_API_KEY={groq_api}\nFISH_AUDIO_API_KEY={fish_api}\nGROQ_API_KEY2={groq_api2}\nTAVILY_SEARCH_API_KEY={tavily_api}"
         f.write(txt)
 
     print("[✓] Config Generated")
