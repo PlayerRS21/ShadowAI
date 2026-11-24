@@ -16,6 +16,6 @@ def cleanAll():
 
 def writeToFile(txt):
     with open("shadowAI_logs.txt","a") as file:
-        txt = "\n" + str(txt) + "\n"
+        txt = "\n" + str(txt) + f"------{datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%I:%M %p")}\n"
         file.write(txt)
 

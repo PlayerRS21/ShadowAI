@@ -1,49 +1,69 @@
-import os
-import re
-import shutil
-import signal
-import subprocess
-import sys
-import tempfile
-import time
+import os, re, shutil, signal, subprocess, sys, tempfile, time
+from collections import deque
 from typing import Any, Dict, Optional
 
+try:
+    from logsGenerator import writeToFile
+except ImportError:
+    def writeToFile(*args, **kwargs):
+        pass
 
-MAX_OUTPUT = 2000
-GRACE_SECONDS = 3.0
-MARK = "__SHADOW_CWD__"    # hidden marker used to learn the shell's final folder
+try:
+    from ptyTerminal import run_in_embedded_pty
+except ImportError:
+    run_in_embedded_pty = None
 
-_cwd = os.getcwd()         # remembered folder, so `cd` carries over between steps
+MAX_OUTPUT, GRACE_SECONDS, MARK = 2000, 0.35, "__SHADOW_CWD__"
+MAX_SAVED_LOGS = 4
+_cwd = os.getcwd()
 
-# Last-resort safety net (the model can be wrong, this check can't be talked out of it)
-BLOCKED = (
-    "rm -rf /", "rm -rf ~", "rm -rf *", "mkfs", "dd if=", ":(){",
-    "diskpart", "format c:", "format-volume", "clear-disk", "rd /s /q c:\\",
-)
+# Ring buffer storing up to 4 most recent command executions: {id, command, exit_code, status, full_output}
+_log_history: deque = deque(maxlen=MAX_SAVED_LOGS)
+_log_counter = 0
 
-# Linux terminal emulators and the flags each needs to run "bash -c <script>"
-LINUX_TERMINALS = [
-    ("x-terminal-emulator", ["-e", "bash", "-c"]),
-    ("gnome-terminal",      ["--", "bash", "-c"]),
-    ("konsole",             ["-e", "bash", "-c"]),
-    ("xfce4-terminal",      ["-e", "bash -c"]),   # takes one string, handled below
-    ("kitty",               ["bash", "-c"]),
-    ("alacritty",           ["-e", "bash", "-c"]),
-    ("wezterm",             ["start", "--", "bash", "-c"]),
-    ("ghostty",             ["-e", "bash", "-c"]),
-    ("foot",                ["bash", "-c"]),
-    ("xterm",               ["-e", "bash", "-c"]),
+BLOCKED_PATTERNS = [
+    r"(^|[;&|\s]):\(\)\s*\{",
+    r"\b(mkfs(\.[a-z0-9]+)?|fdisk|parted|wipefs|diskpart|format-volume|clear-disk)\b",
+    r"\bformat\s+[a-z]:",
+    r"\bdd\b.*\bof=/dev/(sd|nvme|hd|vd|mmcblk)",
+    r"\b(chmod|chown)\b.*\s(-R|--recursive)\s+(/|~|\*)",
+    r">\s*/dev/(sd|nvme|hd|vd|mmcblk)",
 ]
 
-# Matches a trailing "&" (with optional "> /dev/null 2>&1" before it)
+FORCE_DELETE_PATTERNS = [
+    r"(^|[;&|\s])rm\s+(?=.*(?:-[a-zA-Z]*[rR]|--recursive))(?=.*(?:-[a-zA-Z]*f|--force))",
+    r"(^|[;&|\s])rm\s+(?:-[a-zA-Z]*f|--force)\s+.*(\*|/|~|\.\.)",
+    r"(^|[;&|\s])rm\s+(?:-[a-zA-Z]*[rR]|--recursive)\s+(/+|~|\*|\.\.|/(bin|boot|dev|etc|home|lib|opt|proc|root|sbin|sys|usr|var)\b)",
+    r"(^|[;&|\s])(rd|rmdir)\s+.*(/s.*(/q)|/q.*(/s))",
+    r"(^|[;&|\s])del\s+.*(/f.*(/s)|/s.*(/f))",
+    r"(^|[;&|\s])(remove-item|ri|rm)\s+(?=.*-recurse)(?=.*-force)",
+    r"(^|[;&|\s])(rd|rmdir|del|remove-item)\s+.*([c-z]:\\(windows|program files|users|system32|\*|$))",
+]
+
+ALWAYS_INTERACTIVE = {
+    "htop", "btop", "top", "vim", "nvim", "nano", "micro", "less", "man", "alsamixer",
+    "sudo", "doas", "su",
+}
+PKG_MANAGERS = {"pacman", "yay", "paru", "apt", "apt-get", "dnf", "zypper", "winget", "choco", "brew"}
+_PKG_MUTATE = re.compile(
+    r"\b(pacman|yay|paru)\s+.*-[SRU]|"
+    r"\b(apt|apt-get|dnf|zypper|winget|choco|brew)\s+(install|remove|uninstall|upgrade|update|purge|reinstall)\b",
+    re.I,
+)
+
+LOCKERS = {"hyprlock", "swaylock", "i3lock", "gtklock", "waylock"}
+DETACHED_APPS = {
+    "mpv", "vlc", "ffplay", "xdg-open", "open", "start", "start-process",
+    "google-chrome", "chromium", "firefox", "brave", "code", "codium",
+    "thunar", "nautilus", "dolphin", "obs", "gimp", "steam", "discord", "spotify",
+    "sleep", "start-sleep", *LOCKERS,
+}
+
 _BG_SUFFIX = re.compile(r"\s*(?:>\s*/dev/null)?\s*(?:2>&1)?\s*&\s*$")
+_ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])|\x03\d{0,2}(?:,\d{1,2})?|[\x00-\x08\x0b-\x1f]")
 
 
-# ---------------------------------------------------------------------------
-# Small helpers
-# ---------------------------------------------------------------------------
 def os_family() -> str:
-    """Return 'Windows', 'macOS' or 'Linux'. Never returns None."""
     if sys.platform == "win32":
         return "Windows"
     if sys.platform == "darwin":
@@ -54,263 +74,316 @@ def os_family() -> str:
 
 
 def has_display() -> bool:
-    """True if a GUI session exists (needed to open a terminal window)."""
     if os_family() == "Linux":
         return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
     return True
 
 
-def _trim(text: str) -> str:
-    """Cut long output so the model's request never gets too big."""
-    text = (text or "").replace("\x00", "").strip()
-    if len(text) > MAX_OUTPUT:
-        text = text[:MAX_OUTPUT] + "\n...[output truncated]"
-    return text
+def _strip_ansi(text: str) -> str:
+    return _ANSI_ESCAPE.sub("", (text or "").replace("\x00", "").replace("\r", "\n")).strip()
+
+
+def _tail_lines(text: str, n: int = 14) -> str:
+    clean = _strip_ansi(text)
+    if not clean:
+        return ""
+    lines = [ln.strip() for ln in clean.splitlines() if ln.strip()]
+    if len(lines) > n:
+        half = n // 2
+        selected = lines[:half] + [f"... ({len(lines) - n} lines omitted) ..."] + lines[-half:]
+    else:
+        selected = lines
+    out = "\n".join(selected)
+    return out[:MAX_OUTPUT] + "\n...[truncated]" if len(out) > MAX_OUTPUT else out
+
+
+def _record_log(command: str, status: str, exit_code: Optional[int], full_output: str) -> int:
+    global _log_counter
+    _log_counter += 1
+    _log_history.append({
+        "id": _log_counter,
+        "command": command,
+        "status": status,
+        "exit_code": exit_code,
+        "full_output": _strip_ansi(full_output),
+    })
+    return _log_counter
+
+
+def get_command_log(log_id: Optional[int] = None) -> str:
+    """Retrieve full stored output for a specific log ID (or latest if None)."""
+    if not _log_history:
+        return "No command logs saved yet."
+    entry = next((item for item in _log_history if item["id"] == log_id), None) if log_id else _log_history[-1]
+    if not entry:
+        avail = ", ".join(f"#{x['id']}" for x in _log_history)
+        return f"Log #{log_id} not found (available: {avail})."
+    body = entry["full_output"] or "(no output captured)"
+    return f"=== FULL LOG #{entry['id']} | cmd: {entry['command']} | status: {entry['status']} | exit={entry['exit_code']} ===\n{body}"
+
+
+def _sanitize_command(command: str) -> str:
+    c = re.sub(r"[\r\n]+", " ", command).strip()
+    return re.sub(r"\bpkill\s+-f\s+", "pkill -x ", c)
+
+
+def _check_safety(command: str) -> Optional[str]:
+    low = command.lower().strip()
+    if any(re.search(p, low) for p in BLOCKED_PATTERNS):
+        return "Blocked by safety filter: catastrophic system/disk operation is strictly forbidden."
+    if any(re.search(p, low) for p in FORCE_DELETE_PATTERNS):
+        return "Blocked by safety filter: forceful/recursive deletion is disabled."
+    return None
+
+
+def _check_duplicate_locker(command: str, os_name: str) -> Optional[str]:
+    """Prevent launching a second Wayland/X11 screen locker if one is already active (avoids compositor crash)."""
+    if os_name != "Linux":
+        return None
+    tokens = [os.path.splitext(s.strip().split()[0].lower())[0] for s in re.split(r"[;&|]+", command) if s.strip()]
+    for locker in LOCKERS:
+        if locker in tokens and shutil.which("pgrep"):
+            res = subprocess.run(["pgrep", "-x", locker], capture_output=True)
+            if res.returncode == 0:
+                return f"{locker} is ALREADY RUNNING (session is already locked—do NOT re-initialize {locker})."
+    return None
 
 
 def _result(os_name: str, **fields) -> Dict[str, Any]:
     return {"os": os_name, **fields}
 
 
-def _shell_quote(text: str) -> str:
-    """Wrap text in single quotes for a POSIX shell."""
-    return "'" + text.replace("'", "'\\''") + "'"
-
-
 def _shell_args(command: str, os_name: str, track_cwd: bool) -> list:
-    """Build the argument list that runs `command` in the right shell for this OS.
-    track_cwd=True appends a hidden marker so we learn the final folder (for `cd`)."""
     if os_name == "Windows":
         exe = shutil.which("pwsh") or shutil.which("powershell") or "powershell"
         script = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; " + command
         if track_cwd:
-            # Print the folder on its own line, then exit with the command's real result
-            script += ('\n$__ok=$?; $__rc=$LASTEXITCODE; '
-                       'Write-Output "`n' + MARK + '$((Get-Location).Path)"; '
-                       'if($__ok){exit 0}elseif($__rc){exit $__rc}else{exit 1}')
+            script += (
+                f'\n$__ok=$?; $__rc=$LASTEXITCODE; Write-Output "`n{MARK}$((Get-Location).Path)"; '
+                f'if($__ok){{exit 0}}elseif($__rc){{exit $__rc}}else{{exit 1}}'
+            )
         return [exe, "-NoProfile", "-Command", script]
-
-    shell = shutil.which("bash") or shutil.which("sh") or "/bin/sh"  # Alpine has only sh
-    script = command
-    if track_cwd:
-        # Remember the exit code, print the folder, then exit with the ORIGINAL code
-        script += f'\n__rc=$?\nprintf \'\\n{MARK}%s\\n\' "$PWD"\nexit $__rc'
+    shell = shutil.which("bash") or shutil.which("sh") or "/bin/sh"
+    script = command + (f'\n__rc=$?\nprintf \'\\n{MARK}%s\\n\' "$PWD"\nexit $__rc' if track_cwd else "")
     return [shell, "-c", script]
 
 
 def _extract_cwd(stdout: str) -> str:
-    """Remove our hidden marker line from the output and update the remembered folder."""
     global _cwd
     kept = []
     for line in stdout.splitlines():
         if line.startswith(MARK):
-            new_dir = line[len(MARK):].strip()
-            if os.path.isdir(new_dir):
-                _cwd = new_dir
+            d = line[len(MARK):].strip()
+            if os.path.isdir(d):
+                _cwd = d
         else:
             kept.append(line)
     return "\n".join(kept)
 
 
-def _auto_background(command: str, os_name: str) -> Optional[str]:
-    """If a POSIX command ends with '&' (e.g. 'nohup mpv x >/dev/null 2>&1 &'), return it
-    cleaned up so we can run it in background mode instead. Otherwise return None."""
-    if os_name == "Windows":
-        return None
+def _classify_execution(command: str, os_name: str, is_interactive: bool, background: bool):
     c = command.strip()
-    if not c.endswith("&") or c.endswith("&&"):
-        return None
-    c = _BG_SUFFIX.sub("", c)                 # drop the redirects and trailing &
-    c = re.sub(r"^\s*nohup\s+", "", c)        # drop a leading nohup
-    return c or None
+    had_bg = False
+    if os_name != "Windows" and c.endswith("&") and not c.endswith("&&"):
+        c = re.sub(r"(^|[;&|]\s*)nohup\s+", r"\1", _BG_SUFFIX.sub("", c)).strip()
+        had_bg = True
+
+    tokens = [
+        os.path.splitext(s.strip().split()[0].lower())[0]
+        for s in re.split(r"[;&|]+", c)
+        if s.strip()
+    ]
+
+    if (
+        is_interactive
+        or any(t in ALWAYS_INTERACTIVE for t in tokens)
+        or (any(t in PKG_MANAGERS for t in tokens) and _PKG_MUTATE.search(c))
+    ):
+        return c, True, False
+
+    if (
+        had_bg
+        or background
+        or (any(t in DETACHED_APPS for t in tokens) and "--help" not in c and "--version" not in c)
+    ):
+        return re.sub(r"(^|[;&|]\s*)nohup\s+", r"\1", c).strip(), False, True
+
+    return c, False, False
 
 
-# ---------------------------------------------------------------------------
-# Interactive mode: opens a visible terminal window
-# ---------------------------------------------------------------------------
 def _run_interactive(command: str, os_name: str) -> Dict[str, Any]:
+    if run_in_embedded_pty is None:
+        log_id = _record_log(command, "error", -1, "ptyTerminal.py not found.")
+        return _result(os_name, success=False, type="non-static", exit_code=-1, log_id=log_id, tail="ptyTerminal.py not found.")
     try:
-        if os_name == "Linux":
-            term = next(((t, a) for t, a in LINUX_TERMINALS if shutil.which(t)), None)
-            if term is None:
-                return _result(os_name, success=False, type="non-static",
-                               error="No supported terminal emulator found.")
-            script = f"{command}; echo; echo '--- Process Exited ---'; read -p 'Press Enter to exit...'"
-            name, flags = term
-            if name == "xfce4-terminal":      # wants the whole command as ONE string
-                process = subprocess.Popen([name, "-e", f"bash -c {_shell_quote(script)}"])
-            else:
-                process = subprocess.Popen([name, *flags, script])
+        print(f"\n[Shadow Terminal] Running: {command}\n" + "-" * 50)
+        res = run_in_embedded_pty(command, _cwd)
+        print("-" * 50 + f"\n[Shadow Terminal] Exited with code {res['exit_code']}\n")
 
-        elif os_name == "macOS":
-            safe = command.replace("\\", "\\\\").replace('"', '\\"')
-            process = subprocess.Popen(
-                ["osascript", "-e", f'tell app "Terminal" to do script "{safe}"'])
-
-        elif os_name == "Windows":
-            exe = shutil.which("pwsh") or "powershell"
-            process = subprocess.Popen([exe, "-NoExit", "-Command", command],
-                                       creationflags=subprocess.CREATE_NEW_CONSOLE)
-        else:
-            return _result(os_name, success=False, type="non-static",
-                           error=f"Unsupported OS: {os_name}")
-
-        return _result(os_name, success=True, type="non-static",
-                       status=f"Opened a terminal for: {command}", pid=process.pid)
+        exit_code = res["exit_code"]
+        full_out = res.get("output", "")
+        status = "succeeded" if exit_code == 0 else "failed"
+        log_id = _record_log(command, status, exit_code, full_out)
+        return _result(
+            os_name,
+            success=(exit_code == 0),
+            type="non-static",
+            exit_code=exit_code,
+            log_id=log_id,
+            tail=_tail_lines(full_out, 14),
+        )
     except Exception as e:
-        return _result(os_name, success=False, type="non-static", error=str(e))
+        log_id = _record_log(command, "error", -1, str(e))
+        return _result(os_name, success=False, type="non-static", exit_code=-1, log_id=log_id, tail=str(e))
 
 
-# ---------------------------------------------------------------------------
-# Headless mode: run, wait, capture output
-# ---------------------------------------------------------------------------
 def _run_headless(command: str, timeout: int, os_name: str) -> Dict[str, Any]:
     try:
         proc = subprocess.Popen(
-            _shell_args(command, os_name, track_cwd=True),
+            _shell_args(command, os_name, True),
             cwd=_cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL,          # password prompts fail fast instead of hanging
+            stdin=subprocess.DEVNULL,
             text=True,
             encoding="utf-8",
-            errors="replace",                  # bad bytes become '?', never a crash
-            start_new_session=(os_name != "Windows"),   # own process group, killable as one
+            errors="replace",
+            start_new_session=(os_name != "Windows"),
         )
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            # Kill the shell AND everything it started
             if os_name == "Windows":
-                subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
-                               capture_output=True)
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
             else:
                 os.killpg(proc.pid, signal.SIGKILL)
-            proc.communicate()
-            return _result(os_name, success=False, type="static", exit_code=-1, stdout="",
-                           stderr=f"Timed out after {timeout} seconds and was stopped.")
+            partial_out, partial_err = proc.communicate()
+            combined = f"{partial_out or ''}\n{partial_err or ''}\nTimed out after {timeout}s.".strip()
+            log_id = _record_log(command, "timed_out", -1, combined)
+            return _result(os_name, success=False, type="static", exit_code=-1, log_id=log_id, tail=_tail_lines(combined, 14))
 
         stdout = _extract_cwd(stdout)
-        return _result(os_name, success=proc.returncode == 0, type="static",
-                       exit_code=proc.returncode, stdout=_trim(stdout),
-                       stderr=_trim(stderr), cwd=_cwd)
+        combined = "\n".join(part for part in (stdout.strip(), stderr.strip()) if part)
+        status = "succeeded" if proc.returncode == 0 else "failed"
+        log_id = _record_log(command, status, proc.returncode, combined)
+        return _result(
+            os_name,
+            success=(proc.returncode == 0),
+            type="static",
+            exit_code=proc.returncode,
+            log_id=log_id,
+            tail=_tail_lines(combined, 14),
+            cwd=_cwd,
+        )
     except Exception as e:
-        return _result(os_name, success=False, type="static", exit_code=-1,
-                       stdout="", stderr=str(e))
+        log_id = _record_log(command, "error", -1, str(e))
+        return _result(os_name, success=False, type="static", exit_code=-1, log_id=log_id, tail=str(e))
 
 
-# ---------------------------------------------------------------------------
-# Background mode: launch detached, then CHECK whether it is really running
-# ---------------------------------------------------------------------------
 def _run_background(command: str, os_name: str, grace: float) -> Dict[str, Any]:
-    # Output goes to a temp log file so we can read early errors without blocking
-    log_path = os.path.join(tempfile.gettempdir(),
-                            f"shadow_bg_{os.getpid()}_{int(time.time() * 1000)}.log")
+    log_path = os.path.join(tempfile.gettempdir(), f"shadow_bg_{os.getpid()}_{int(time.time() * 1000)}.log")
     try:
-        if os_name == "Windows":
-            # No console window, and its own process group so it outlives this script
-            flags = {"creationflags": subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP}
-        else:
-            flags = {"start_new_session": True}      # detached from our terminal
-
+        flags = (
+            {"creationflags": subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP}
+            if os_name == "Windows"
+            else {"start_new_session": True}
+        )
         with open(log_path, "wb") as log:
             proc = subprocess.Popen(
-                _shell_args(command, os_name, track_cwd=False),
+                _shell_args(command, os_name, False),
                 cwd=_cwd,
                 stdin=subprocess.DEVNULL,
                 stdout=log,
-                stderr=subprocess.STDOUT,            # errors land in the same log
+                stderr=subprocess.STDOUT,
                 **flags,
             )
-
-        # Watch it for a few seconds: did it survive startup?
         deadline = time.time() + grace
-        while time.time() < deadline and proc.poll() is None:
-            time.sleep(0.1)
-        code = proc.poll()                           # None = still running
-
-        # Read the last part of whatever it printed (warnings, errors, track title...)
+        code = proc.poll()
+        while code is None and time.time() < deadline:
+            time.sleep(0.05)
+            code = proc.poll()
         try:
             with open(log_path, "rb") as f:
-                text = f.read().decode("utf-8", "replace").replace("\r", "\n")
+                text = f.read().decode("utf-8", "replace")
+            os.remove(log_path)
         except OSError:
             text = ""
-        tail = _trim(text[-800:])
-
-        try:
-            os.remove(log_path)       # fine on Linux/macOS; on Windows it may stay, so ignore errors
-        except OSError:
-            pass
 
         if code is None:
-            return _result(os_name, success=True, type="background", running=True,
-                           pid=proc.pid, output=tail)
-        return _result(os_name, success=(code == 0), type="background", running=False,
-                       pid=proc.pid, exit_code=code, output=tail)
+            status = f"initialized_and_running (pid {proc.pid})"
+            log_id = _record_log(command, status, None, text)
+            return _result(
+                os_name, success=True, type="background", running=True,
+                pid=proc.pid, log_id=log_id, tail=_tail_lines(text, 14),
+            )
+
+        status = "exited_ok" if code == 0 else "exited_error"
+        log_id = _record_log(command, status, code, text)
+        return _result(
+            os_name, success=(code == 0), type="background", running=False,
+            pid=proc.pid, exit_code=code, log_id=log_id, tail=_tail_lines(text, 14),
+        )
     except Exception as e:
-        return _result(os_name, success=False, type="background", running=False,
-                       exit_code=-1, output=str(e))
+        log_id = _record_log(command, "error", -1, str(e))
+        return _result(os_name, success=False, type="background", running=False, exit_code=-1, log_id=log_id, tail=str(e))
 
 
-# ---------------------------------------------------------------------------
-# Public functions
-# ---------------------------------------------------------------------------
-def executeCommand(command: str, is_interactive: bool = False, timeout: int = 30,
-                   background: bool = False) -> Dict[str, Any]:
-    """Run a command on Windows, macOS or Linux and return a dict describing the result.
-    background=True is for long-running programs (players, apps, servers)."""
+def _finalize_and_log(command: str, res: Dict[str, Any]) -> Dict[str, Any]:
+    """Write command execution details & formatted feedback to the session log file automatically."""
+    writeToFile(f"Command Executed: {command}")
+    writeToFile(f"Command Result:\n{res}")
+    writeToFile(f"Feedback:\n{format_result(res)}")
+    return res
+
+
+def executeCommand(
+    command: str, is_interactive: bool = False, timeout: int = 30, background: bool = False
+    ) -> Dict[str, Any]:
     os_name = os_family()
-
     if not isinstance(command, str) or not command.strip():
-        return _result(os_name, success=False, type="static", exit_code=-1,stdout="", stderr="Empty command.")
-    if any(bad in command.lower() for bad in BLOCKED):
-        return _result(os_name, success=False, type="static", exit_code=-1,stdout="", stderr="Blocked by safety filter.")
+        return _finalize_and_log(str(command), _result(os_name, success=False, type="static", exit_code=-1, tail="Empty command."))
 
-    # Safety net: if the model still sends 'nohup ... &', treat it as a background launch
-    if not background:
-        cleaned = _auto_background(command, os_name)
-        if cleaned:
-            command, background = cleaned, True
+    # Allow model to inspect any of the last 4 stored command logs via `read_log` or `read_log <id>`
+    m = re.match(r"^read_log(?:\s+#?(\d+))?$", command.strip(), re.I)
+    if m:
+        target_id = int(m.group(1)) if m.group(1) else None
+        return _finalize_and_log(command, _result(os_name, success=True, type="log_inspect", exit_code=0, tail=get_command_log(target_id)))
 
+    command = _sanitize_command(command)
+
+    if reason := _check_safety(command):
+        log_id = _record_log(command, "blocked", -1, reason)
+        return _finalize_and_log(command, _result(os_name, success=False, type="static", exit_code=-1, log_id=log_id, tail=reason))
+
+    if dup_msg := _check_duplicate_locker(command, os_name):
+        log_id = _record_log(command, "already_running", 0, dup_msg)
+        return _finalize_and_log(command, _result(os_name, success=True, type="background", running=True, log_id=log_id, tail=dup_msg))
+
+    command, is_interactive, background = _classify_execution(command, os_name, is_interactive, background)
     if background:
-        return _run_background(command, os_name, GRACE_SECONDS)
-    if is_interactive and has_display():
-        return _run_interactive(command, os_name)
-    return _run_headless(command, timeout, os_name)
+        res = _run_background(command, os_name, GRACE_SECONDS)
+    elif is_interactive and has_display():
+        res = _run_interactive(command, os_name)
+    else:
+        res = _run_headless(command, timeout, os_name)
+
+    return _finalize_and_log(command, res)
 
 
 def format_result(r: Dict[str, Any]) -> str:
-    """Turn the result dict into the 'RESULT:' text sent back to the model."""
     kind = r.get("type")
-    if kind == "non-static":
-        return r.get("status") or f"error: {r.get('error')}"
+    if kind == "log_inspect":
+        return r.get("tail", "(empty log)")
+
+    avail_ids = ", ".join(f"#{x['id']}" for x in _log_history) or "none"
+    header = f"[Log #{r.get('log_id', '?')} | saved: {avail_ids}]"
+    tail = r.get("tail") or "(no output yet)"
+
     if kind == "background":
         if r.get("running"):
-            state = f"STARTED and still running after {GRACE_SECONDS:g}s (pid {r.get('pid')})"
-        else:
-            state = (f"EXITED with code {r.get('exit_code')} within {GRACE_SECONDS:g}s "
-                     "(a launcher may have handed off to another process if the code is 0)")
-        return state + (f"\n{r['output']}" if r.get("output") else "")
-    out = r.get("stdout") or r.get("stderr") or "(no output)"
-    if r.get("stdout") and r.get("stderr"):
-        out += f"\n[stderr] {r['stderr']}"
-    return f"exit={r['exit_code']}\n{out}"
+            return f"{header} STATUS: INITIALIZED & RUNNING (pid {r.get('pid', 'active')})\nLines:\n{tail}"
+        return f"{header} STATUS: EXITED (code={r.get('exit_code')})\nLines:\n{tail}"
 
-
-# ---------------------------------------------------------------------------
-# Self-test: run `python commandEngine.py` (works on Linux, macOS and Windows)
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    # PowerShell needs '&' to run a quoted path
-    py = ("& " if os_family() == "Windows" else "") + f'"{sys.executable}"'
-    tests = [
-        ("echo hello",                                         {}),                # prints hello
-        ("exit 3",                                             {}),                # exit=3
-        (f'cd "{tempfile.gettempdir()}"',                      {}),                # change folder
-        ("pwd",                                                {}),                # shows temp folder
-        (f'{py} -c "import time; time.sleep(5)"',             {"timeout": 2}),    # times out
-        (f'{py} -c "import time; time.sleep(30)"',            {"background": True}),  # STARTED, running
-        (f'{py} -c "import sys; sys.exit(4)"',                {"background": True}),  # EXITED with code 4
-    ]
-    for cmd, opts in tests:
-        print(f"{cmd!r} {opts}\n  -> {format_result(executeCommand(cmd, **opts))}\n")
+    state = "SUCCEEDED" if r.get("success") else f"EXITED (code={r.get('exit_code', -1)})"
+    hint = "\n(Run `read_log <id>` if you need the full log to diagnose.)" if not r.get("success") else ""
+    return f"{header} STATUS: {state}\nLines:\n{tail}{hint}"
